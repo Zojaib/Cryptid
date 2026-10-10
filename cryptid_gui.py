@@ -17,7 +17,7 @@ import threading
 import time
 
 from cryptography.exceptions import InvalidTag
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSettings, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
@@ -32,7 +32,7 @@ APP_NAME = "Cryptid"
 
 # Steel and brass: a vault, not a dashboard. The accent changes with the mode.
 C = dict(bg="#1a2230", panel="#202a3a", field="#2a3649", line="#33415a",
-         text="#e8edf5", muted="#92a2b8", ok="#74d3a0", err="#f0786d", on_accent="#1a2230")
+         text="#e8edf5", muted="#92a2b8", ok="#74d3a0", err="#f0786d", warn="#e9a84c", on_accent="#1a2230")
 ACCENTS = {"encrypt": "#e0ae45", "decrypt": "#4cc3b4", "verify": "#7fa6e8"}
 THEME = {"accent": ACCENTS["encrypt"]}
 
@@ -129,6 +129,12 @@ QToolButton#x:disabled {{ color: #4a566b; }}
 QToolTip {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['line']}; padding: 4px; }}
 QMessageBox {{ background: {C['panel']}; }}
 """
+
+
+def _printable(name: str, limit: int = 60) -> str:
+    """A name read from inside an encrypted file, safe to put in a label."""
+    s = "".join(ch if ch.isprintable() else "?" for ch in name)
+    return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
 # -- Small widgets -------------------------------------------------------------
@@ -241,7 +247,7 @@ class JobRow(QFrame):
 
     def set_state(self, state: str, text: str, frac: float, detail: str = ""):
         color = {"ready": C["muted"], "running": THEME["accent"], "ok": C["ok"], "error": C["err"],
-                 "skipped": C["muted"], "cancelled": C["muted"]}[state]
+                 "partial": C["warn"], "skipped": C["muted"], "cancelled": C["muted"]}[state]
         self.status.setStyleSheet(f"color: {color};")
         self.status.setText(text)
         self.bar.setValue(int(frac * 1000))
@@ -268,20 +274,21 @@ class Job:
 class Worker(QThread):
     row_update = Signal(int, str, float, str, str)   # index, state, fraction, status, detail
     log = Signal(str)
-    summary = Signal(int, int, int, int)             # ok, failed, skipped, cancelled
+    summary = Signal(int, int, int, int, int)        # ok, failed, skipped, cancelled, partly recovered
     output_dir = Signal(str)
 
     def __init__(self, mode, paths, password, out_dir, opts, overwrite, known_ext=(core.DEFAULT_EXTENSION,),
-                 keyfile=None):
+                 keyfile=None, salvage=False):
         super().__init__()
         self.keyfile = keyfile
+        self.salvage = salvage      # decrypt: keep the readable part of a damaged file
         self.mode, self.paths, self.password = mode, paths, password
         self.out_dir, self.opts, self.overwrite = out_dir, opts, overwrite
         self.known_ext = tuple(known_ext)
         self.cancel = threading.Event()
 
     def run(self):
-        ok = failed = skipped = cancelled = 0
+        ok = failed = skipped = cancelled = partial = 0
         bad_pw_streak = 0
         for i, path in enumerate(self.paths):
             name = os.path.basename(path.rstrip("\\/")) or path
@@ -289,7 +296,7 @@ class Worker(QThread):
                 self.row_update.emit(i, "cancelled", 0.0, "Cancelled", "")
                 cancelled += 1
                 continue
-            if self.mode in ("decrypt", "verify") and ok == 0 and bad_pw_streak >= 3:
+            if self.mode in ("decrypt", "verify") and ok + partial == 0 and bad_pw_streak >= 3:
                 self.row_update.emit(i, "skipped", 0.0, "Not tried",
                                      "Stopped: the password was wrong for the first 3 files.")
                 skipped += 1
@@ -306,6 +313,8 @@ class Worker(QThread):
                 if self.mode == "encrypt":
                     r = core.encrypt_path(path, self.out_dir, self.password, self.opts, hooks)
                     detail = f"{core.size_str(r.in_size)} → {core.size_str(r.out_size)}  ·  {os.path.basename(r.output)}"
+                    if self.opts.hide_name:
+                        detail += "  ·  name hidden"
                     if self.opts.keyfile:
                         detail += "  ·  password + key file"
                     tag = {"trashed": "original moved to the Trash", "deleted": "original deleted",
@@ -319,10 +328,14 @@ class Worker(QThread):
                     r = core.verify_path(path, self.password, hooks, keyfile=self.keyfile)
                     what = f"{r.files} file{'s' if r.files != 1 else ''}  ·  " if r.is_folder else ""
                     detail = f"All data intact  ·  {what}{core.size_str(r.out_size)}"
+                    if r.names:     # what is inside: the only way to tell files with hidden names apart
+                        inside = ", ".join(_printable(n) for n in r.names[:2]) + (", …" if len(r.names) > 2 else "")
+                        detail += f"  ·  contains {inside}"
                 else:
                     r = core.decrypt_path(path, self.out_dir, self.password, self.overwrite, hooks, self.known_ext,
-                                          keyfile=self.keyfile)
-                    detail = f"Restored  ·  {os.path.basename(r.output.rstrip(chr(92) + '/'))}"
+                                          keyfile=self.keyfile, salvage=self.salvage)
+                    detail = (f"{'Damaged: only part was recovered' if r.partial else 'Restored'}  ·  "
+                              f"{os.path.basename(r.output.rstrip(chr(92) + '/'))}")
                 for w in r.warnings:
                     self.log.emit(f"Warning ({name}): {w}")
                 if self.mode == "verify":
@@ -330,8 +343,12 @@ class Worker(QThread):
                 else:
                     self.log.emit(f"Done: {name} → {r.output}")
                     self.output_dir.emit(os.path.dirname(r.output) if os.path.isfile(r.output) else r.output)
-                self.row_update.emit(i, "ok", 1.0, "Verified" if self.mode == "verify" else "Done", detail)
-                ok += 1
+                if r.partial:
+                    self.row_update.emit(i, "partial", 1.0, "Incomplete", detail)
+                    partial += 1
+                else:
+                    self.row_update.emit(i, "ok", 1.0, "Verified" if self.mode == "verify" else "Done", detail)
+                    ok += 1
                 bad_pw_streak = 0
             except core.Cancelled:
                 self.row_update.emit(i, "cancelled", 0.0, "Cancelled", "")
@@ -359,7 +376,7 @@ class Worker(QThread):
                 self.log.emit(f"Failed: {name}: {e}")
                 failed += 1
         self.password = ""
-        self.summary.emit(ok, failed, skipped, cancelled)
+        self.summary.emit(ok, failed, skipped, cancelled, partial)
 
 
 # -- Create a key file ---------------------------------------------------------
@@ -582,6 +599,11 @@ class MainWindow(QWidget):
         self._ext_flash = ""
         self.row_frac: list[float] = []
         self.last_output_dir = ""
+        self._generated_pw = ""      # the password "Generate" made, until the fields are cleared
+        self._generated_saved = False   # the user confirmed having saved it
+        self._shown_for_generated = False
+        self._clip_pw = ""           # what "Copy" put on the clipboard (cleared again after a minute)
+        self._clip_token = 0
 
         self._build()
         self._load_settings()
@@ -737,6 +759,20 @@ class MainWindow(QWidget):
         self.strength_lbl = small("")
         self.strength_lbl.setWordWrap(True)
         self.weak_chk = QCheckBox("Use this weak password anyway")
+        self.gen_btn = QPushButton("Generate a strong password")
+        self.gen_btn.setToolTip("Fills in a random password (about 124 bits) from the computer's random generator.\n"
+                                "Save it in a password manager before you encrypt: it cannot be recovered.")
+        self.gen_btn.clicked.connect(self.generate_password)
+        self.copy_pw_btn = QPushButton("Copy")
+        self.copy_pw_btn.setToolTip("Copies the generated password so you can paste it into your password manager.\n"
+                                    "The clipboard is cleared again after one minute (a clipboard history tool, "
+                                    "if you use one, keeps its own copy).")
+        self.copy_pw_btn.setVisible(False)
+        self.copy_pw_btn.clicked.connect(self.copy_generated_password)
+        gen_row = QHBoxLayout()
+        gen_row.setContentsMargins(0, 0, 0, 0)
+        gen_row.addWidget(self.gen_btn, 1)
+        gen_row.addWidget(self.copy_pw_btn)
         self.confirm_box = QWidget()
         cb = QVBoxLayout(self.confirm_box)
         cb.setContentsMargins(0, 0, 0, 0)
@@ -745,6 +781,7 @@ class MainWindow(QWidget):
         cb.addWidget(self.strength)
         cb.addWidget(self.strength_lbl)
         cb.addWidget(self.weak_chk)
+        cb.addLayout(gen_row)
         pl.addWidget(self.pw1)
         pl.addWidget(self.confirm_box)
         pl.addWidget(self.show_pw)
@@ -836,6 +873,12 @@ class MainWindow(QWidget):
         self.ext_preview.setWordWrap(True)
         eo.addWidget(self.ext_preview)
         self.ext_edit.textChanged.connect(self._refresh_ext_ui)
+        self.chk_hide = QCheckBox("Hide the file names")
+        self.chk_hide.setToolTip(
+            "The encrypted file gets a random name instead of “name.enc”, so the cloud does not see what it is.\n"
+            "The real name is stored inside and comes back when you decrypt. Verify shows what a file contains.")
+        self.chk_hide.toggled.connect(self._refresh_ext_ui)
+        eo.addWidget(self.chk_hide)
         eo.addSpacing(6)
         hl2 = QFrame()
         hl2.setObjectName("hline")
@@ -865,6 +908,12 @@ class MainWindow(QWidget):
         self.cmb_over = _combo([("Keep both (add a number)", "rename"), ("Replace it", "overwrite"),
                                 ("Skip it", "skip")], "rename")
         sb.addWidget(self.cmb_over)
+        self.chk_salvage = QCheckBox("Recover what is readable from damaged files")
+        self.chk_salvage.setToolTip(
+            "Normally a damaged file restores nothing. With this, everything that could still be read and "
+            "checked before the damage is kept,\nclearly marked: folders get “(incomplete)” added and a file "
+            "that was cut short ends in “.partial”. The password must still be right.")
+        sb.addWidget(self.chk_salvage)
         self.cmb_out.currentIndexChanged.connect(self._out_changed)
         pl.addWidget(self.save_box)
 
@@ -923,6 +972,7 @@ class MainWindow(QWidget):
             if idx >= 0:
                 cb.setCurrentIndex(idx)
         self.chk_verify.setChecked(s.value("verify", True, bool))
+        self.chk_hide.setChecked(s.value("hide_names", False, bool))
         self.log_btn.setChecked(s.value("log", False, bool))
         self.ext_edit.setText(s.value("ext", "", str))
         self.kf_path = s.value("keyfile", "", str)
@@ -934,6 +984,7 @@ class MainWindow(QWidget):
         for cb, key in ((self.cmb_comp, "comp"), (self.cmb_kdf, "kdf"), (self.cmb_over, "over")):
             s.setValue(key, cb.currentData())
         s.setValue("verify", self.chk_verify.isChecked())
+        s.setValue("hide_names", self.chk_hide.isChecked())
         s.setValue("log", self.log_btn.isChecked())
         s.setValue("keyfile", self.kf_path)           # only the location, never the contents
         s.setValue("keyfile_on", self.kf_chk.isChecked())
@@ -999,6 +1050,9 @@ class MainWindow(QWidget):
         self.confirm_box.setVisible(enc)
         self.enc_opts.setVisible(enc)
         self.save_box.setVisible(not ver)
+        self.chk_salvage.setVisible(mode == "decrypt")
+        if changed:
+            self.chk_salvage.setChecked(False)     # a rescue tool: on only when asked for, each time
         self.verify_note.setVisible(ver)
         note = self._apply_destination(mode)
         self.pw1.setPlaceholderText("Password" if enc else "Password used to encrypt")
@@ -1013,8 +1067,7 @@ class MainWindow(QWidget):
         self.ph_icon.setText(icon)
         self.ph_title.setText(title)
         self.ph_hint.setText(hint)
-        self.pw1.clear()
-        self.pw2.clear()
+        self._forget_password()
         self.update_strength()
         self.refresh_queue()      # also refreshes the key file area
         if note:
@@ -1067,7 +1120,10 @@ class MainWindow(QWidget):
             if len(sample) > 30:
                 sample = sample[:27] + "…"
             self.ext_preview.setStyleSheet("")
-            self.ext_preview.setText(f"Result: {sample}.{ext}")
+            if self.chk_hide.isChecked():
+                self.ext_preview.setText(f"Result: a random name such as 3f9c1a7be2d04c55.{ext}")
+            else:
+                self.ext_preview.setText(f"Result: {sample}.{ext}")
         if self.mode == "encrypt":
             self.ph_hint.setText(self._encrypt_hint())
 
@@ -1270,24 +1326,79 @@ class MainWindow(QWidget):
         pw = self.pw1.text()
         if self.mode != "encrypt":
             return
-        color, text = C["muted"], "Use a long passphrase, for example four random words."
+        color, text = C["muted"], "Use a long passphrase of random words, or generate a password."
         value, weak = 0, False
         if pw:
-            ent, ok = core.password_strength(pw)
+            ent, ok, hint = core.password_feedback(pw)
             value = max(min(int(ent / 80 * 100), 100), 4)
             if not ok:
                 weak, color = True, C["err"]
-                text = f"Too weak (about {ent:.0f} bits). Try a passphrase of 4+ random words."
+                text = f"{hint.rstrip('.')} (about {ent:.0f} bits)."
             elif ent < 70:
                 color, text = THEME["accent"], "Good."
             else:
                 color, text = C["ok"], "Strong."
+        self.copy_pw_btn.setVisible(bool(pw) and pw == self._generated_pw)
         self.strength.setValue(value)
         self.strength.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; border-radius: 2px; }}")
         self.strength_lbl.setText(text)
         self.weak_chk.setVisible(weak)
         if not weak:
             self.weak_chk.setChecked(False)
+
+    def generate_password(self):
+        pw = core.generate_password()
+        self._generated_pw = pw
+        self._generated_saved = False
+        if not self.show_pw.isChecked():       # it has to be read to be saved
+            self.show_pw.setChecked(True)
+            self._shown_for_generated = True
+        self.pw1.setText(pw)
+        self.pw2.setText(pw)
+        self.update_strength()
+        self.flash("Password generated: save it somewhere safe before you encrypt.", "muted")
+
+    def copy_generated_password(self):
+        if not self._generated_pw:
+            return
+        self._clip_pw = self._generated_pw
+        self._clip_token += 1
+        token = self._clip_token
+        QApplication.clipboard().setText(self._clip_pw)
+        QTimer.singleShot(60_000, lambda: self._clear_clipboard(token))
+        self.flash("Copied. The clipboard is cleared again in one minute.", "muted")
+
+    def _clear_clipboard(self, token=None):
+        """Take the generated password off the clipboard again, unless something else was copied since.
+        A timer only acts for the copy that started it: copying again restarts the minute."""
+        if token is not None and token != self._clip_token:
+            return
+        if self._clip_pw and QApplication.clipboard().text() == self._clip_pw:
+            QApplication.clipboard().clear()
+        self._clip_pw = ""
+
+    def _forget_password(self):
+        self._generated_pw = ""
+        self._generated_saved = False
+        self.pw1.clear()
+        self.pw2.clear()
+        if self._shown_for_generated:          # "Show password" was switched on by Generate, not by the user
+            self._shown_for_generated = False
+            self.show_pw.setChecked(False)
+
+    def _confirm_password_saved(self) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Did you save the password?")
+        box.setText("This password was generated a moment ago and exists nowhere else.")
+        box.setInformativeText(
+            "Save it in a password manager, or write it down, before you continue. It is cleared from this "
+            "window when the job finishes, and without it nobody can open the encrypted files.")
+        go = box.addButton("I saved it", QMessageBox.ButtonRole.AcceptRole)
+        back = box.addButton("Go back", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(back)
+        box.exec()
+        return box.clickedButton() is go
 
     def _after_changed(self):
         destructive = self.cmb_after.currentData() != "keep"
@@ -1388,6 +1499,10 @@ class MainWindow(QWidget):
                 self.flash(ext_err, "err")
                 self.ext_edit.setFocus()
                 return
+            if pw == self._generated_pw and not self._generated_saved:
+                if not self._confirm_password_saved():
+                    return
+                self._generated_saved = True
             after = self.cmb_after.currentData()
             if after != "keep" and not self._confirm_remove_originals(after):
                 return
@@ -1407,7 +1522,8 @@ class MainWindow(QWidget):
             kdf_profile=self.cmb_kdf.currentData(), compression=self.cmb_comp.currentData(),
             verify=self.chk_verify.isChecked(), after=self.cmb_after.currentData(),
             overwrite=self.cmb_over.currentData(), keyfile=keyfile if enc else None,
-            extension=self._ext_state()[0] or core.DEFAULT_EXTENSION)
+            extension=self._ext_state()[0] or core.DEFAULT_EXTENSION,
+            hide_name=enc and self.chk_hide.isChecked())
         if enc:
             self._remember_ext(opts.extension)
         self.row_frac = [0.0] * len(self.jobs)
@@ -1419,7 +1535,8 @@ class MainWindow(QWidget):
         self.last_output_dir = ""
         self.log.clear()
         self.worker = Worker(self.mode, [j.path for j in self.jobs], pw, out_dir, opts,
-                             self.cmb_over.currentData(), self._known_exts(), keyfile=keyfile)
+                             self.cmb_over.currentData(), self._known_exts(), keyfile=keyfile,
+                             salvage=self.mode == "decrypt" and self.chk_salvage.isChecked())
         self.worker.row_update.connect(self.on_row_update)
         self.worker.log.connect(self.append_log)
         self.worker.output_dir.connect(self._remember_output)
@@ -1457,7 +1574,7 @@ class MainWindow(QWidget):
         if idx >= len(self.jobs):
             return
         self.jobs[idx].row.set_state(state, text, frac, detail)
-        self.row_frac[idx] = 1.0 if state in ("ok", "error", "skipped", "cancelled") else frac
+        self.row_frac[idx] = 1.0 if state in ("ok", "error", "partial", "skipped", "cancelled") else frac
         n = len(self.row_frac)
         self.overall.setValue(int(sum(self.row_frac) / n * 1000))
         if state == "running":
@@ -1467,25 +1584,27 @@ class MainWindow(QWidget):
             if self.jobs[idx].row.parent() is not None:
                 self.list.scrollToItem(self.jobs[idx].item)
 
-    def on_summary(self, ok, failed, skipped, cancelled):
+    def on_summary(self, ok, failed, skipped, cancelled, partial=0):
         worker, self.worker = self.worker, None
         if worker:
             worker.wait()
             worker.deleteLater()
         self.set_busy(False)
         parts = [f"{ok} verified" if self.mode == "verify" else f"{ok} done"]
+        if partial:
+            parts.append(f"{partial} only partly recovered (see Details)")
         if failed:
             parts.append(f"{failed} failed")
         if skipped:
             parts.append(f"{skipped} skipped")
         if cancelled:
             parts.append(f"{cancelled} cancelled")
-        self.flash("Finished: " + ", ".join(parts) + ".", "err" if failed else "ok")
-        if failed:
-            self.overall.setStyleSheet(f"QProgressBar#overall::chunk {{ background: {C['err']}; }}")
-        if ok and failed == 0 and cancelled == 0:
-            self.pw1.clear()
-            self.pw2.clear()
+        self.flash("Finished: " + ", ".join(parts) + ".", "err" if failed or partial else "ok")
+        if failed or partial:
+            self.overall.setStyleSheet(
+                f"QProgressBar#overall::chunk {{ background: {C['err'] if failed else C['warn']}; }}")
+        if ok and failed == 0 and cancelled == 0 and partial == 0:
+            self._forget_password()
         self.open_btn.setVisible(bool(self.last_output_dir))
         QApplication.alert(self)
 
@@ -1498,6 +1617,7 @@ class MainWindow(QWidget):
                 return
             self.worker.cancel.set()
             self.worker.wait(8000)
+        self._clear_clipboard()
         self._save_settings()
         e.accept()
 
@@ -1544,7 +1664,30 @@ def _selftest() -> int:
             pass
         r6 = core.decrypt_path(r5.output, os.path.join(d, "out3"), pw, keyfile=kf)
         with open(r6.output, "rb") as f:
-            return 0 if f.read() == data else 1
+            if f.read() != data:
+                return 1
+        r7 = core.encrypt_path(src, os.path.join(d, "h"), pw, core.EncryptOptions(kdf_profile="light", hide_name=True))
+        if "t.bin" in os.path.basename(r7.output) or core.verify_path(r7.output, pw).names != ["t.bin"]:
+            return 1                             # hidden name: random outside, real name inside
+        r8 = core.decrypt_path(r7.output, os.path.join(d, "out4"), pw)
+        with open(r8.output, "rb") as f:
+            if os.path.basename(r8.output) != "t.bin" or f.read() != data:
+                return 1
+        with open(r.output, "rb") as f:          # a damaged file: nothing by default, a marked part with salvage
+            blob = bytearray(f.read())
+        blob[len(blob) * 2 // 3] ^= 0xFF
+        bad = os.path.join(d, "bad.enc")
+        with open(bad, "wb") as f:
+            f.write(blob)
+        try:
+            core.decrypt_path(bad, os.path.join(d, "out5"), pw)
+            return 1
+        except (InvalidTag, ValueError):
+            pass
+        r9 = core.decrypt_path(bad, os.path.join(d, "out6"), pw, salvage=True)
+        with open(r9.output, "rb") as f:
+            part = f.read()
+        return 0 if r9.partial and part and data.startswith(part) else 1
     except Exception:  # noqa: BLE001
         return 1
     finally:

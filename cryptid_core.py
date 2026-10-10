@@ -33,8 +33,23 @@ Security model (what is trusted, and when):
   * Originals are only removed after the written file was decrypted again in full
     and its SHA-256 matched the data that was read.
 
+Since the first public version (the file format did not change):
+
+  * The limits the restore step enforces (nesting depth, path length, entry count, total size)
+    are now checked before encrypting, and the read-back check walks an archive with the same
+    code that restores it. Before, a folder nested deeper than the restore limit, or one whose
+    name looks like a drive letter ("C: backup"), encrypted and verified fine and then could
+    not be decrypted.
+  * Names the restoring system cannot store (a:b.txt, aux.txt or "name." on Windows, names that
+    are too long) are renamed when restoring instead of making the whole restore fail.
+  * Optional: hide the original name (random output name, real name stored inside), and
+    recover the readable part of a damaged file (see decrypt_path(salvage=True)).
+
+  Still true: restoring needs a destination whose path is short enough. A tree whose paths are
+  already at the system's limit restores only into a folder with a shorter path than it came from.
+
 Key file (optional second factor, like KeePass): the header's KDF id is 2 instead of 1.
-The encryption key is HMAC-SHA256(key = digest of the key file, message = Argon2id output),
+The encryption key is HMAC-SHA256(key = digest of the key file, message = label + Argon2id output),
 so opening a file needs the password AND the key file. Files without a key file stay
 byte-for-byte compatible with the original scripts; files with one are refused by them
 (unknown KDF id) rather than failing with a misleading "wrong password".
@@ -100,6 +115,8 @@ CHUNK_LEN_SIZE = 4
 NONCE_PREFIX_LEN = 4
 TERMINAL_COUNTER = 0xFFFF_FFFF_FFFF_FFFF
 HEADER_SIZE = 4 + 1 + 1 + 1 + 1 + 4 + 4 + 4 + 4 + 16 + 4 + 8  # 52 bytes
+
+MAX_ORIG_SIZE = 1024 ** 4      # 1 TiB: the largest original this format version restores
 
 KDF_MIN_TIME_COST = 2
 KDF_MIN_MEMORY_COST = 19456
@@ -180,6 +197,10 @@ class LimitExceeded(ValueError):
     """An archive went beyond one of the safety limits (size, entries, disk space...)."""
 
 
+class SourceReadError(ValueError):
+    """The encrypted file itself could not be read (a bad sector, a network drive that dropped)."""
+
+
 class Hooks:
     """Cancel flag + throttled progress + log, shared by one job."""
 
@@ -217,6 +238,7 @@ class EncryptOptions:
     after: str = "keep"             # keep | trash | delete | wipe
     overwrite: str = "rename"       # rename | overwrite | skip
     extension: str = DEFAULT_EXTENSION   # file extension of the encrypted file, without the dot
+    hide_name: bool = False         # random output name; the real name is stored inside and restored on decrypt
 
 
 @dataclass
@@ -228,6 +250,8 @@ class Result:
     folders: int = 0        # verify: folders found inside a folder archive
     is_folder: bool = False  # verify: the archive holds a folder, not a single file
     original: str = ""       # encrypt: what happened to the original: kept | trashed | deleted | wiped
+    names: List[str] = field(default_factory=list)   # verify/decrypt: top-level names stored inside an archive
+    partial: bool = False    # decrypt(salvage=True): the file is damaged, only the readable part was restored
     warnings: List[str] = field(default_factory=list)
 
 
@@ -262,16 +286,123 @@ def _looks_like_tar(path: str) -> bool:
         return False
 
 
-def password_strength(password: str):
-    """Same rule as the original script. Returns (entropy_bits, acceptable)."""
+MIN_PASSWORD_LEN = 16
+MIN_PASSWORD_BITS = 50
+
+# What people actually type. Each of these counts as one guess-list entry, not as random letters.
+_COMMON_WORDS = sorted((
+    "password", "passwort", "contrasena", "contraseña", "qwerty", "qwertz", "azerty", "letmein", "welcome",
+    "admin", "administrator", "login", "master", "dragon", "monkey", "iloveyou", "teamo", "secret", "secreto",
+    "football", "baseball", "princess", "sunshine", "shadow", "superman", "batman", "trustno", "hello",
+    "hola", "freedom", "whatever", "starwars", "pokemon", "computer", "internet", "michael", "jordan",
+    "summer", "winter", "spring", "autumn", "love", "god", "test", "guest", "root", "user", "default",
+    "changeme", "cryptid", "encrypt", "abc", "asdf", "zxcv", "pass", "key", "enc",
+), key=len, reverse=True)
+_KEY_ROWS = ("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm", "qwertzuiop", "azertyuiop",
+             "1qaz2wsx3edc4rfv5tgb6yhn7ujm", "zaq1xsw2cde3vfr4bgt5nhy6mju7")     # rows, then columns
+_PW_ANALYSED = 128      # characters looked at: more cannot change the verdict, and the search is not linear
+_LEET = str.maketrans("013457@$!", "oleastasi")
+
+
+def _run_bits(length: int) -> float:
+    """What a repeat, a sequence or a keyboard walk is worth: where it starts and how long it is."""
+    return 6.0 + 2.0 * math.log2(length)
+
+
+def _pattern_at(low: str, plain: str, i: int):
+    """(length, bits) of the longest predictable stretch starting at i, or (0, 0)."""
+    best = [0, 0.0]
+
+    def consider(length: int, bits: float):
+        if length > best[0] or (length == best[0] and bits < best[1]):
+            best[0], best[1] = length, bits
+
+    for w in _COMMON_WORDS:                          # a word from every cracking list (also with l33t letters)
+        if low.startswith(w, i) or plain.startswith(w, i):
+            consider(len(w), 10.0)
+            break                                    # sorted longest first
+    n = len(low)
+    j = i + 1                                        # the same character again, or abc / 321
+    if j < n:
+        step = ord(low[j]) - ord(low[i])
+        if step in (0, 1, -1):
+            while j < n and ord(low[j]) - ord(low[j - 1]) == step:
+                j += 1
+            if j - i >= 3:
+                consider(j - i, _run_bits(j - i))
+    for row in _KEY_ROWS:                            # a walk along the keyboard, either direction
+        for r in (row, row[::-1]):
+            k = r.find(low[i])
+            if k < 0:
+                continue
+            m = 1
+            while i + m < n and k + m < len(r) and low[i + m] == r[k + m]:
+                m += 1
+            if m >= 3:
+                consider(m, _run_bits(m))
+    m = min(n - i, i, 32)                            # something already typed earlier in the password
+    while m >= 3:
+        if low[i:i + m] in low[:i]:
+            consider(m, 4.0)
+            break
+        m -= 1
+    return best[0], best[1]
+
+
+def password_feedback(password: str):
+    """(estimated_bits, acceptable, hint). The hint says what is wrong, or "" if nothing is.
+
+    An estimate, not a proof: it counts character variety like the original script did, but no longer
+    gives full credit to repeats (aaaa), sequences (1234, abcd), keyboard walks (qwerty), repeated
+    blocks (hunterhunter) or the words every cracking list starts with. A passphrase of ordinary words
+    is still credited per character, so prefer random words or the generator.
+    """
+    if not password:
+        return 0.0, False, ""
     has_lower = any(c.islower() for c in password)
     has_upper = any(c.isupper() for c in password)
     has_digit = any(c.isdigit() for c in password)
     has_symbol = any(not c.isalnum() for c in password)
     charset = (26 * has_lower) + (26 * has_upper) + (10 * has_digit) + (32 * has_symbol)
-    charset = max(charset, 26)
-    entropy = len(password) * math.log2(charset)
-    return entropy, (len(password) >= 16 and entropy >= 50)
+    per_char = math.log2(charset or 26)       # 0: letters of a script without upper and lower case
+    low = password[:_PW_ANALYSED].lower()
+    plain = low.translate(_LEET)
+    bits, i, predictable = 0.0, 0, 0
+    while i < len(low):
+        length, cost = _pattern_at(low, plain, i)
+        if length and cost < length * per_char:
+            bits += cost
+            predictable += length
+            i += length
+        else:
+            bits += per_char
+            i += 1
+    hint = ""
+    if len(password) < MIN_PASSWORD_LEN:
+        hint = f"Too short: use at least {MIN_PASSWORD_LEN} characters."
+    elif bits < MIN_PASSWORD_BITS:
+        hint = ("Too predictable: it is mostly repeats, sequences or common words."
+                if predictable * 2 >= len(low) else "Too weak: mix in more different characters.")
+    return bits, not hint, hint
+
+
+def password_strength(password: str):
+    """(entropy_bits, acceptable). Same rule as the original script (16+ characters and 50+ bits),
+    with a less gullible estimate: see password_feedback."""
+    bits, ok, _hint = password_feedback(password)
+    return bits, ok
+
+
+# Lower-case letters and digits without the look-alikes (i l o 0 1): easy to read, type and dictate.
+_PW_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+
+
+def generate_password(groups: int = 5, group_len: int = 5) -> str:
+    """A random password such as 'k7fqm-2xwhp-9rtbn-c3hnv-u8dze' from the operating system's
+    random generator: about 4.95 bits per character, 124 bits with the defaults."""
+    if groups < 1 or group_len < 1:
+        raise ValueError("groups and group_len must be at least 1")
+    return "-".join("".join(secrets.choice(_PW_ALPHABET) for _ in range(group_len)) for _ in range(groups))
 
 
 def _resolve_output(path: str, policy: str, is_dir: bool = False) -> str:
@@ -564,7 +695,7 @@ def _parse_header(raw: bytes) -> dict:
     if not (16 * 1024 <= chunk_size <= 16 * 1024 * 1024):
         raise FormatError(f"Suspicious chunk size {chunk_size}.")
     _check_kdf_params(time_cost, memory_cost, parallelism)   # before any key derivation
-    if orig_size > 1024 ** 4:
+    if orig_size > MAX_ORIG_SIZE:
         raise FormatError(f"Suspicious original size {orig_size}.")
     return {"codec": codec, "keyfile": kdf_id == KDF_ARGON2ID_KEYFILE, "chunk_size": chunk_size,
             "time_cost": time_cost,
@@ -579,8 +710,8 @@ class Limits:
     """Upper bounds applied while decoding and restoring. The defaults are far above
     anything a real backup reaches; they exist so that a damaged or hostile file
     stops with a clear message instead of filling the disk or the memory."""
-    max_total_bytes: int = 1024 ** 4        # decoded stream, 1 TiB (same ceiling as the header check)
-    max_file_bytes: int = 1024 ** 4         # one file inside an archive
+    max_total_bytes: int = MAX_ORIG_SIZE    # decoded stream, 1 TiB (same ceiling as the header check)
+    max_file_bytes: int = MAX_ORIG_SIZE     # one file inside an archive
     max_entries: int = 2_000_000            # files + folders in one archive
     max_path_len: int = 4096                # characters in an archive path
     max_component_len: int = 255            # one name inside that path, in bytes
@@ -593,6 +724,9 @@ class Limits:
 
 
 _STREAM_SLACK = 1 << 20                     # end-of-archive blocks and read-ahead
+_READ_STEP = 1 << 20                        # how much is pulled through the decoder per read
+_SALVAGE_STEP = 16 << 10                    # salvage reads in small steps: a read that hits the damage
+                                            # returns nothing, so everything before it must be out already
 _ENTRY_SLACK = 16 << 10                     # tar header + padding + PAX record per entry
 _LINK_TYPES = (tarfile.SYMTYPE, tarfile.LNKTYPE)
 _META_TYPES = (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE,
@@ -677,16 +811,23 @@ class _ChunkDecryptReader(io.RawIOBase):
         if extra:
             raise ValueError("Unexpected extra data after the end of the compressed stream.")
 
+    def _read(self, n: int) -> bytes:
+        try:
+            return self._fin.read(n)
+        except OSError as e:
+            raise SourceReadError(f"The encrypted file could not be read at this point "
+                                  f"({e.strerror or e}).") from e
+
     def _next_chunk(self) -> bytes:
         if self._hooks:
             self._hooks.check()
-        raw_len = self._fin.read(CHUNK_LEN_SIZE)
+        raw_len = self._read(CHUNK_LEN_SIZE)
         if len(raw_len) < CHUNK_LEN_SIZE:
             raise ValueError("Unexpected end of file - the file is truncated.")
         chunk_len = struct.unpack("<I", raw_len)[0]
         if chunk_len < TAG_SIZE or chunk_len > self._chunk_size + TAG_SIZE:
             raise ValueError(f"Corrupt chunk length at chunk {self._counter}.")
-        ct_and_tag = self._fin.read(chunk_len)
+        ct_and_tag = self._read(chunk_len)
         if len(ct_and_tag) < chunk_len:
             raise ValueError(f"Truncated chunk at chunk {self._counter}.")
         self._consumed += CHUNK_LEN_SIZE + chunk_len
@@ -703,7 +844,7 @@ class _ChunkDecryptReader(io.RawIOBase):
                     if stored != self._counter:
                         raise ValueError(f"Chunk count mismatch ({stored} vs {self._counter}) - "
                                          "file truncated or spliced.")
-                    if self._fin.read(1):
+                    if self._read(1):
                         raise ValueError("Unexpected data after the end of the file.")
                     self.done = True
                     return b""
@@ -860,12 +1001,12 @@ def _make_decompress_stream(source, codec: int, chunk_size: int, limits: Limits)
     return source
 
 
-def _pick_codec(mode: str, tarred: bool, src: str) -> int:
+def _pick_codec(mode: str, is_dir: bool, src: str) -> int:
     if mode == "none":
         return COMPRESS_NONE
     if mode == "lzma":
         return COMPRESS_LZMA
-    if mode == "auto" and not tarred and Path(src).suffix.lower() in INCOMPRESSIBLE_EXT:
+    if mode == "auto" and not is_dir and Path(src).suffix.lower() in INCOMPRESSIBLE_EXT:
         return COMPRESS_NONE
     return COMPRESS_ZSTD if ZSTD_AVAILABLE else COMPRESS_LZMA
 
@@ -879,7 +1020,8 @@ def _make_temp(directory: str):
 
 
 def _make_temp_dir(directory: str) -> str:
-    return tempfile.mkdtemp(prefix=".encv-", suffix=".tmpdir", dir=directory)  # mode 0700
+    # Mode 0700. The name is kept short: while restoring, every path inside is this much longer.
+    return tempfile.mkdtemp(prefix=".encv-", dir=directory)
 
 
 def _fsync_dir(directory: str):
@@ -1012,6 +1154,9 @@ def _translate_oserror(e: OSError) -> Optional[Exception]:
     if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
         return LimitExceeded("The disk is full (or a quota was reached). Free some space or pick another "
                              "destination and try again. Nothing was left behind.")
+    if e.errno == errno.ENAMETOOLONG or getattr(e, "winerror", None) == 206:
+        return LimitExceeded("A file name or path is too long for this location. Choose a folder with a "
+                             "shorter path (or a shorter name) and try again. Nothing was left behind.")
     return None
 
 
@@ -1028,7 +1173,7 @@ def _scan_dir(target: str, skipped: List[str]):
     def _raise(err):
         raise err
 
-    top = os.path.basename(os.path.abspath(target).rstrip("\\/")) or "folder"
+    top = os.path.basename(os.path.abspath(target)) or "folder"
     entries = []
     for root, dirs, files in os.walk(target, onerror=_raise):
         keep = []
@@ -1273,9 +1418,32 @@ class _Payload:
             pass
 
 
+class _HashTap:
+    """Hashes and counts everything read through it (used to check a freshly written file)."""
+
+    def __init__(self, guard: _Guarded):
+        self._g, self.digest, self.count = guard, hashlib.sha256(), 0
+
+    def read(self, n=-1):
+        data = self._g.read(n)
+        self.digest.update(data)
+        self.count += len(data)
+        return data
+
+    def allow(self, n: int):
+        pass    # the exact length is known here, no allowance is needed
+
+    def close(self):
+        pass
+
+
 def _roundtrip_check(path: str, raw_header: bytes, aesgcm: AESGCM, expected_len: int,
-                     expected_sha: bytes, hooks: Hooks, lo: float, hi: float):
-    """Decrypt + decode the finished file completely and compare it with what was read."""
+                     expected_sha: bytes, hooks: Hooks, lo: float, hi: float, tarred: bool = False):
+    """Decrypt + decode the finished file completely and compare it with what was read.
+
+    An archive is also walked with the very code that restores it, under the same limits, so a
+    file that passes here is one decrypt_path will accept (names, depth, entry count, sizes).
+    """
     total = max(os.path.getsize(path), 1)
     header = _parse_header(raw_header)
     try:
@@ -1284,25 +1452,29 @@ def _roundtrip_check(path: str, raw_header: bytes, aesgcm: AESGCM, expected_len:
             f.seek(HEADER_SIZE)
             pl = _Payload(f, raw_header, header, hooks, Limits(), total, "Verifying",
                           aesgcm=aesgcm, exact_len=expected_len, span=(lo, hi))
-            digest = hashlib.sha256()
-            n = 0
+            tap = _HashTap(pl.guard)
             try:
+                if tarred:
+                    ex = _Extractor(None, tap, hooks, Limits(), Result(),
+                                    written_cap=header["orig_size"] + _STREAM_SLACK)
+                    ex.run()
+                    if ex.ignored:
+                        raise ValueError(f"{ex.ignored} item(s) inside would not be restored")
+                    _check_size_match(header, ex.content, ex.links, True)
                 while True:
                     hooks.check()
-                    chunk = pl.guard.read(1 << 20)
-                    if not chunk:
+                    if not tap.read(1 << 20):
                         break
-                    digest.update(chunk)
-                    n += len(chunk)
                 pl.reader.finish()
             finally:
                 pl.close()
-        if n != expected_len or digest.digest() != expected_sha:
+        if tap.count != expected_len or tap.digest.digest() != expected_sha:
             raise ValueError("the decrypted data does not match what was read")
     except Cancelled:
         raise
     except (InvalidTag, ValueError, OSError) as e:
-        raise RuntimeError(f"Verification of the encrypted file failed ({e or type(e).__name__}). "
+        why = str(e) or ("a block failed its integrity check" if isinstance(e, InvalidTag) else type(e).__name__)
+        raise RuntimeError(f"Verification of the encrypted file failed ({why.rstrip('.')}). "
                            "The original was not touched.")
 
 
@@ -1318,37 +1490,119 @@ def _tarinfo_class(max_header_bytes: int):
     return _SafeTarInfo
 
 
-_WIN_BAD_CHARS = set('<>:"|?*') | {chr(i) for i in range(32)}
-_WIN_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
-                 *(f"lpt{i}" for i in range(1, 10))}
+_WINDOWS = os.name == "nt"
+# A name inside an archive is split at '/' only (that is all this app ever writes). On Windows a
+# backslash in it is therefore part of a Linux file name, and is replaced like any other character
+# Windows cannot store: no component that reaches the file system contains a separator.
+_WIN_BAD_CHARS = set('<>:"|?*\\/') | {chr(i) for i in range(32)}
+_WIN_RESERVED = {"con", "prn", "aux", "nul", "conin$", "conout$",
+                 *(f"com{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+                 *(f"lpt{i}" for i in "123456789\u00b9\u00b2\u00b3")}
 
 
-def _safe_parts(name: str, limits: Limits) -> Optional[List[str]]:
+def _win_safe_name(part: str) -> str:
+    """One path component made acceptable to Windows (which refuses a:b, 'aux', 'name.' ...)."""
+    q = "".join("_" if c in _WIN_BAD_CHARS else c for c in part).rstrip(" .")
+    if not q:
+        q = "_"
+    if q.split(".")[0].rstrip(" ").lower() in _WIN_RESERVED:    # "aux", "AUX.txt", "aux .txt"
+        q = "_" + q
+    return q
+
+
+def _name_units(name: str, windows: bool) -> int:
+    """Length of a name the way the file system counts it: UTF-16 units on Windows, bytes elsewhere."""
+    if windows:
+        return len(name.encode("utf-16-le", "surrogatepass")) // 2
+    try:
+        return len(name.encode("utf-8", "surrogateescape"))
+    except UnicodeEncodeError:
+        return len(name.encode("utf-8", "surrogatepass"))
+
+
+def _fit_name(name: str, marker: str = "", windows: Optional[bool] = None, limit: int = 255) -> str:
+    """name + marker, with the name shortened (its extension kept if possible) until the file
+    system can store the result."""
+    if windows is None:
+        windows = _WINDOWS
+    if _name_units(name + marker, windows) <= limit:
+        return name + marker
+    root, ext = os.path.splitext(name)
+    if _name_units(ext + marker, windows) >= limit // 2:      # no real extension, just a long name with a dot
+        root, ext = name, ""
+    while root and _name_units(root + ext + marker, windows) > limit:
+        root = root[:-1]
+    return (root or "_") + ext + marker
+
+
+def _safe_parts(name: str, limits: Limits, windows: Optional[bool] = None,
+                fit: bool = False) -> Optional[List[str]]:
     """Split an archive path into safe components, or None if it must not be restored.
 
-    Rejects absolute paths, drive letters, '..', NUL; limits length and depth.
-    Raises LimitExceeded for paths beyond the limits.
+    Rejects absolute paths, '..' and NUL; limits path length and depth (LimitExceeded beyond them).
+    With windows=True (the default on Windows) components Windows cannot store are renamed rather
+    than dropped: an archive made on Linux must still restore completely. No component keeps a
+    ':' or a backslash, so none can name a drive, a stream or another folder.
+    A component longer than the file system allows raises LimitExceeded, or with fit=True (used
+    when restoring) is shortened.
     """
+    if windows is None:
+        windows = _WINDOWS
     if "\x00" in name:
         return None
-    n = name.replace("\\", "/") if os.name == "nt" else name
-    if n.startswith("/") or (len(n) > 1 and n[1] == ":" and n[0].isalpha()):
+    if name.startswith("/"):
         return None
-    if len(n) > limits.max_path_len:
+    if len(name) > limits.max_path_len:
         raise LimitExceeded(f"An entry has a path longer than {limits.max_path_len} characters.")
-    parts = [p for p in n.split("/") if p not in ("", ".")]
+    parts = [p for p in name.split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
         return None
     if len(parts) > limits.max_depth:
         raise LimitExceeded(f"An entry is nested deeper than {limits.max_depth} folders.")
-    for p in parts:
-        if len(p.encode("utf-8", "surrogateescape")) > limits.max_component_len:   # file systems count bytes
-            raise LimitExceeded(f"An entry has a name longer than {limits.max_component_len} characters.")
-        if os.name == "nt":
-            if (any(c in _WIN_BAD_CHARS for c in p) or p.endswith((" ", "."))
-                    or p.split(".")[0].lower() in _WIN_RESERVED):
-                return None
+    if windows:
+        parts = [_win_safe_name(p) for p in parts]
+    for i, p in enumerate(parts):
+        if _name_units(p, windows) > limits.max_component_len:
+            if not fit:
+                raise LimitExceeded(f"An entry has a name longer than the {limits.max_component_len} "
+                                    f"{'characters' if windows else 'bytes'} a file system stores.")
+            parts[i] = _fit_name(p, "", windows, limits.max_component_len)
     return parts
+
+
+def _show_path(path: str, n: int = 160) -> str:
+    """One of the user's own paths for a message: readable (accents stay), but nothing unprintable."""
+    s = "".join(c if c.isprintable() else "?" for c in path)
+    return s if len(s) <= n else s[:60] + " ... " + s[-(n - 65):]
+
+
+def _preflight(entries, orig_size: int, limits: Limits):
+    """Refuse, before any work, a source the restore step would not accept.
+
+    The restore limits are deliberately strict (they also face damaged or hostile files), so the
+    same limits are applied here: nothing may be written that this app would later refuse to open.
+    """
+    if orig_size > MAX_ORIG_SIZE:
+        raise LimitExceeded(f"This is {size_str(orig_size)}; one encrypted file holds at most "
+                            f"{size_str(MAX_ORIG_SIZE)}. Split it into smaller parts first.")
+    if not entries:
+        return
+    if len(entries) > limits.max_entries:
+        raise LimitExceeded(f"This folder holds {len(entries):,} items; one encrypted file holds at most "
+                            f"{limits.max_entries:,}. Encrypt its subfolders separately.")
+    for full, arc, size, _kind, _mtime in entries:
+        try:
+            # Names come from this file system, so they fit it (a system with a shorter limit shortens
+            # them when restoring). Path length and depth are refused by the restore step: check those.
+            parts = _safe_parts(arc, limits, windows=False, fit=True)
+        except LimitExceeded as e:
+            raise LimitExceeded(f"Cannot encrypt '{_show_path(full)}': {str(e)[0].lower()}{str(e)[1:]} "
+                                "Shorten or flatten it and try again.") from None
+        if parts is None:
+            raise LimitExceeded(f"Cannot encrypt '{_show_path(full)}': its name cannot be stored safely.")
+        if size > limits.max_file_bytes:
+            raise LimitExceeded(f"Cannot encrypt '{_show_path(full)}': it is larger than "
+                                f"{size_str(limits.max_file_bytes)}.")
 
 
 class _Extractor:
@@ -1360,9 +1614,17 @@ class _Extractor:
     """
 
     def __init__(self, dest: Optional[str], guard: _Guarded, hooks: Hooks, limits: Limits,
-                 res: Result, written_cap: int):
+                 res: Result, written_cap: int, keep_partial: bool = False,
+                 windows: Optional[bool] = None):
         self.dest, self.guard, self.hooks, self.limits, self.res = dest, guard, hooks, limits, res
         self.written_cap = written_cap
+        self.keep_partial = keep_partial   # salvage: keep the readable start of a file cut short by damage
+        self.windows = _WINDOWS if windows is None else windows
+        self.names: List[str] = []         # top-level names, in archive order
+        self.partial_files: List[str] = []
+        self.done_files = 0                # files written completely
+        self.renamed = 0                   # entries renamed because this system cannot store their name
+        self._dir_alias: dict = {}         # (parent, name) -> the name a folder got when a file had it
         self.files = self.folders = 0
         self.content = 0        # sum of the sizes of regular files listed in the archive
         self.written = 0        # bytes actually written (hard-link copies included)
@@ -1380,12 +1642,19 @@ class _Extractor:
     def _ensure_dirs(self, parts: List[str]) -> str:
         path = self.dest
         for p in parts:
-            path = os.path.join(path, p)
+            cand = os.path.join(path, self._dir_alias.get((path, p), p))
             try:
-                os.mkdir(path, 0o700)
+                os.mkdir(cand, 0o700)
             except FileExistsError:
-                if os.path.islink(path) or not os.path.isdir(path):
-                    raise FormatError("The archive lists a file and a folder under the same name.")
+                if os.path.islink(cand) or not os.path.isdir(cand):
+                    # A file already has this name: two names that differ only in case, or that
+                    # became equal when they were adapted to this system. Keep both.
+                    cand = self._unique(cand)
+                    os.mkdir(cand, 0o700)
+                    self._dir_alias[(path, p)] = os.path.basename(cand)
+                    _add_warning(self.res, f"A file and a folder share the name '{_show(p)}'; the folder "
+                                           f"was saved as '{_show(os.path.basename(cand))}'.")
+            path = cand
         return path
 
     def _parent_dir(self, parts: List[str]) -> str:
@@ -1424,13 +1693,14 @@ class _Extractor:
     def _write_file(self, tar, m, parts):
         path, fd = self._new_file(os.path.join(self._parent_dir(parts), parts[-1]))
         ok = False
+        remaining = m.size
         try:
             with os.fdopen(fd, "wb") as out:
                 src = tar.extractfile(m)
-                remaining = m.size
+                step = _SALVAGE_STEP if self.keep_partial else _READ_STEP
                 while remaining > 0:
                     self.hooks.check()
-                    chunk = src.read(min(1 << 20, remaining))
+                    chunk = src.read(min(step, remaining))
                     if not chunk:
                         raise FormatError("The archive ends in the middle of a file.")
                     self._account(len(chunk))
@@ -1439,15 +1709,34 @@ class _Extractor:
             ok = True
         finally:
             if not ok:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+                self._drop_or_keep_partial(path, m.size - remaining)
         self._finish_file(path, m.mode, m.mtime)
+
+    def _drop_or_keep_partial(self, path: str, got: int):
+        """A file that could not be written completely: remove it, or (salvage) keep what was read.
+
+        What is kept always ends in .partial. If it cannot be given that name it is removed, and if
+        even that fails the error is raised: no restore is better than an unmarked piece of a file.
+        """
+        if self.keep_partial and got > 0:
+            alt = os.path.join(os.path.dirname(path), _fit_name(os.path.basename(path), ".partial", self.windows))
+            if os.path.lexists(alt):
+                alt = self._unique(alt)
+            try:
+                os.rename(path, alt)
+                self.partial_files.append(alt)
+                return
+            except OSError:
+                pass
+        try:
+            os.remove(path)
+        except OSError:
+            if self.keep_partial:
+                raise
 
     def _copy_link(self, m, parts):
         """Old archives store a second name for the same file as a hard link: restore it as a copy."""
-        tparts = _safe_parts(m.linkname, self.limits)
+        tparts = _safe_parts(m.linkname, self.limits, self.windows, fit=True)
         target = os.path.join(self.dest, *tparts) if tparts else None
         try:
             st = os.lstat(target) if target else None
@@ -1485,6 +1774,7 @@ class _Extractor:
             pass
 
     def _finish_file(self, path: str, mode: int, mtime):
+        self.done_files += 1
         try:
             os.chmod(path, 0o600 | (mode & 0o100))   # private; keeps "runnable" for the owner
         except OSError:
@@ -1501,13 +1791,17 @@ class _Extractor:
                     if self.files + self.folders + self.ignored >= self.limits.max_entries:
                         raise LimitExceeded(f"The archive has more than {self.limits.max_entries:,} entries.")
                     self.guard.allow(_ENTRY_SLACK)
-                    parts = _safe_parts(m.name, self.limits)
+                    parts = _safe_parts(m.name, self.limits, self.windows, fit=True)
                     if parts is None:
                         if m.name not in ("", ".", "./"):
                             self._ignore(m.name, "unsafe entry")
                         continue
+                    if parts != [p for p in m.name.split("/") if p not in ("", ".")]:
+                        self.renamed += 1
                     if len(parts) > 1:
                         self.nested = True
+                    if parts[0] not in self.names and len(self.names) < 50:
+                        self.names.append(parts[0])
                     if m.isdir():
                         self.folders += 1
                         if self.dest:
@@ -1536,6 +1830,11 @@ class _Extractor:
             self._set_mtime(path, mtime)
         if self.ignored > 12:
             self.res.warnings.append(f"{self.ignored} entries were not restored in total.")
+        if self.renamed:
+            self.res.warnings.append(
+                f"{self.renamed} item{'s have names' if self.renamed != 1 else ' has a name'} this system "
+                "cannot store (too long, or on Windows characters like : ? * and reserved names such as "
+                "AUX); they were renamed or shortened.")
 
 
 def _check_size_match(header: dict, content: int, links: bool, is_tar: bool):
@@ -1585,6 +1884,9 @@ def _encrypt_path(src: str, out_dir: Optional[str], password: str,
                          "would remove the encrypted file too. Choose another destination.")
     ext = clean_extension(opts.extension)
     out_name = os.path.basename(src) + "." + ext
+    if opts.hide_name:
+        # Nothing about the original shows in the name; the real name travels inside (see below).
+        out_name = secrets.token_hex(8) + "." + ext
     if opts.overwrite == "skip" and os.path.lexists(os.path.join(out_dir, out_name)):
         raise Skipped(f"'{out_name}' already exists")
 
@@ -1599,16 +1901,19 @@ def _encrypt_path(src: str, out_dir: Optional[str], password: str,
         st0 = os.stat(src)
         orig_size = st0.st_size
         snapshot = (st0.st_size, st0.st_mtime_ns)
-        if _looks_like_tar(src):  # keep a real .tar restorable as a file
+        if opts.hide_name or _looks_like_tar(src):
+            # Wrapped in a one-entry archive: that is where the name (and date) of a file with a
+            # hidden name is kept, and what keeps a real .tar restorable as a file.
             real = os.path.realpath(src)
             entries = [(real, os.path.basename(src), orig_size, "file", st0.st_mtime_ns)]
     tarred = entries is not None
+    _preflight(entries, orig_size, Limits())
     for s in skipped[:10]:
         res.warnings.append(f"Not included (link or special file): {s}")
     if len(skipped) > 10:
         res.warnings.append(f"...and {len(skipped) - 10} more links or special files not included.")
 
-    codec = _pick_codec(opts.compression, tarred, src)
+    codec = _pick_codec(opts.compression, is_dir, src)
     level = 3 if opts.compression == "fast" else 10
 
     if opts.kdf_profile == "auto":
@@ -1683,7 +1988,7 @@ def _encrypt_path(src: str, out_dir: Optional[str], password: str,
 
         if verify:
             _roundtrip_check(tmp_path, header, aesgcm, counting.count, digest.digest(),
-                             hooks, enc_hi, 1.0)
+                             hooks, enc_hi, 1.0, tarred=tarred)
         hooks.check()
         out_path = _publish_file(tmp_path, out_dir, out_name, opts.overwrite)
         tmp_path = None
@@ -1733,9 +2038,21 @@ def _weak_kdf_warning(header: dict, res: Result):
 def decrypt_path(src: str, out_dir: Optional[str], password: str,
                  overwrite: str = "rename", hooks: Optional[Hooks] = None,
                  known_ext=(DEFAULT_EXTENSION,), limits: Optional[Limits] = None,
-                 keyfile: Optional[str] = None) -> Result:
+                 keyfile: Optional[str] = None, salvage: bool = False) -> Result:
+    """Restore an encrypted file. Nothing is published unless every block and the end marker check out.
+
+    salvage=True is for a file that is damaged (a bad sector, an interrupted download): instead of
+    restoring nothing, it keeps what could be read and authenticated before the damage, clearly
+    marked: a folder gets " (incomplete)" added to its name, and a file that is not known to be
+    whole ends in ".partial". Result.partial is then True, and the result is saved under a new
+    name whatever `overwrite` says. Every byte kept still passed its integrity check and the
+    password must be right; what cannot be vouched for is only that nothing is missing.
+    Nothing is recovered if the damage is in the first block (that is indistinguishable from a
+    wrong password), and a file of less than 512 bytes is all or nothing.
+    """
     try:
-        return _decrypt_path(src, out_dir, password, overwrite, hooks, known_ext, limits or Limits(), keyfile)
+        return _decrypt_path(src, out_dir, password, overwrite, hooks, known_ext, limits or Limits(),
+                             keyfile, salvage)
     except OSError as e:
         t = _translate_oserror(e)
         if t:
@@ -1743,7 +2060,31 @@ def decrypt_path(src: str, out_dir: Optional[str], password: str,
         raise
 
 
-def _decrypt_path(src, out_dir, password, overwrite, hooks, known_ext, limits, keyfile=None) -> Result:
+def _mark_incomplete(tmp_dir: str):
+    """Rename what a salvage produced so that every top-level item says it is not the whole thing:
+    folders get " (incomplete)", files end in ".partial"."""
+    for entry in sorted(os.listdir(tmp_dir)):
+        item = os.path.join(tmp_dir, entry)
+        if os.path.isdir(item) and not os.path.islink(item):
+            marked = _fit_name(entry, " (incomplete)")
+        elif entry.endswith(".partial"):
+            continue
+        else:
+            marked = _fit_name(entry, ".partial")
+        target = os.path.join(tmp_dir, marked)
+        if os.path.lexists(target):
+            target = _Extractor._unique(target)
+        os.rename(item, target)
+
+
+def _damage_text(e: Exception, pl: "_Payload", total: int) -> str:
+    why = "a block failed its integrity check" if isinstance(e, InvalidTag) else str(e).rstrip(".")
+    where = min(100, int(100 * (HEADER_SIZE + pl.reader._consumed) / max(total, 1)))
+    return f"{why} (about {where}% into the file)"
+
+
+def _decrypt_path(src, out_dir, password, overwrite, hooks, known_ext, limits, keyfile=None,
+                  salvage=False) -> Result:
     hooks = hooks or Hooks()
     res = Result()
     src = os.path.abspath(src)
@@ -1756,6 +2097,7 @@ def _decrypt_path(src, out_dir, password, overwrite, hooks, known_ext, limits, k
     hooks.progress(0.0, "Reading", force=True)
     tmp_file = tmp_dir = None
     kept: List[str] = []
+    damage: Optional[Exception] = None
     try:
         with open(src, "rb") as fin:
             raw_header = fin.read(HEADER_SIZE)
@@ -1778,39 +2120,72 @@ def _decrypt_path(src, out_dir, password, overwrite, hooks, known_ext, limits, k
                     os.makedirs(out_dir, exist_ok=True)
                     tmp_dir = _make_temp_dir(out_dir)
                     ex = _Extractor(tmp_dir, pl.guard, hooks, limits, res,
-                                    written_cap=header["orig_size"] + _STREAM_SLACK)
-                    ex.run()
-                    pl.finish()
-                    _check_size_match(header, ex.content, ex.links, True)
+                                    written_cap=header["orig_size"] + _STREAM_SLACK, keep_partial=salvage)
+                    try:
+                        ex.run()
+                        pl.finish()
+                        _check_size_match(header, ex.content, ex.links, True)
+                    except LimitExceeded:
+                        raise
+                    except (InvalidTag, ValueError) as e:
+                        if not salvage or not (ex.done_files or ex.partial_files):
+                            raise
+                        damage = e
+                        note = f"{ex.done_files} complete file{'s' if ex.done_files != 1 else ''}"
+                        if ex.partial_files:
+                            note += f" and the start of {len(ex.partial_files)} more (.partial)"
+                        res.warnings.append(f"Damaged: {_damage_text(e, pl, total)}. Recovered {note}; "
+                                            "anything stored after the damage is missing.")
                     res.out_size = ex.written
+                    res.names = list(ex.names)
+                    res.files = ex.done_files
                 else:
                     if overwrite == "skip" and os.path.lexists(os.path.join(out_dir, plain)):
                         raise Skipped(f"'{plain}' already exists")
                     os.makedirs(out_dir, exist_ok=True)
                     fd, tmp_file = _make_temp(out_dir)
+                    written = 0
+                    step = _SALVAGE_STEP if salvage else _READ_STEP
                     with os.fdopen(fd, "wb") as fout:
-                        while True:
-                            hooks.check()
-                            chunk = pl.guard.read(1 << 20)
-                            if not chunk:
-                                break
-                            fout.write(chunk)
+                        try:
+                            while True:
+                                hooks.check()
+                                chunk = pl.guard.read(step)
+                                if not chunk:
+                                    break
+                                fout.write(chunk)
+                                written += len(chunk)
+                            pl.finish()
+                            _check_size_match(header, pl.guard.count, False, False)
+                        except LimitExceeded:
+                            raise
+                        except (InvalidTag, ValueError) as e:
+                            if not salvage or not written:
+                                raise
+                            damage = e
+                            res.warnings.append(
+                                f"Damaged: {_damage_text(e, pl, total)}. Recovered the first {size_str(written)} "
+                                f"of {size_str(header['orig_size'])}; the rest is missing.")
                         fout.flush()
                         os.fsync(fout.fileno())
-                    pl.finish()
-                    _check_size_match(header, pl.guard.count, False, False)
-                    res.out_size = pl.guard.count
+                    res.out_size = written
             finally:
                 pl.close()
 
         hooks.check()
+        res.partial = damage is not None
+        if res.partial:
+            overwrite = "rename"     # a partial result never replaces anything, and is never skipped
         if is_tar:
+            if res.partial:          # make it impossible to mistake for a complete restore
+                _mark_incomplete(tmp_dir)
             kept = _publish_tree(tmp_dir, out_dir, overwrite, res)
             shutil.rmtree(tmp_dir, ignore_errors=True)
             tmp_dir = None
             res.output = kept[0] if len(kept) == 1 else out_dir
         else:
-            res.output = _publish_file(tmp_file, out_dir, plain, overwrite)
+            res.output = _publish_file(tmp_file, out_dir,
+                                       _fit_name(plain, ".partial") if res.partial else plain, overwrite)
             tmp_file = None
     finally:
         if tmp_file and os.path.lexists(tmp_file):
@@ -1865,6 +2240,7 @@ def verify_path(src: str, password: str, hooks: Optional[Hooks] = None,
                 pl.finish()
                 _check_size_match(header, ex.content, ex.links, True)
                 res.files, res.folders = ex.files, ex.folders
+                res.names = list(ex.names)
                 res.is_folder = ex.nested or ex.folders > 0
                 res.out_size = ex.content
                 if ex.ignored:
