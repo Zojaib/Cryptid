@@ -47,6 +47,3 @@ The password is asked for, or read from `CRYPTID_PASSWORD` or `--password-file`.
 
 The file format is described in [FORMAT.md](FORMAT.md), so files can be read without this app.
 
-## Tests
-
-`pip install pytest`, then `python -m pytest tests`.
